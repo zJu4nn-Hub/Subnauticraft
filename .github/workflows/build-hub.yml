@@ -1,0 +1,159 @@
+# Build used by the zJu4nn Hub "Mashups" tab.
+# - The Minecraft Fabric mod (minecraft/) is compiled HERE from this fork's source, at the upstream 2.18.1 commit
+#   967b52f — the commit the Subnautica plugin below was built from (its InformationalVersion reads
+#   "2.18.1+967b52fa…"). The plugin and the mod talk over a local socket (127.0.0.1:25599) with NO version
+#   handshake, so both halves must come from the same commit.
+# - The Subnautica BepInEx plugin compiles against the game's own assemblies (not redistributable), so it is taken
+#   from the upstream 2.18.1 release, pinned by sha256. There is no upstream release of 2.19.x, so 2.18.1 is the
+#   newest matched pair.
+# - The upstream jar of the same release is downloaded (pinned) only to check that ours has the same classes.
+# - Optional `mundo_automatico`: back-ports, from upstream ccf4404 (2.19.2), the three Minecraft-only files that
+#   open a world by themselves (AutoWorld + the two "no experimental settings screen" mixins). The upstream
+#   changelog says the Subnautica half did not change for that (2.18.2). OFF by default: needs the owner's OK.
+# - Gradle 8.14.2 + Loom 1.11 run on JDK 21 (NOT 25 like the Loom 1.18 mashups: Gradle 8.14 does not run on 25).
+# Upstream: https://github.com/JasonNinja15/Subnauticraft (MIT; LICENSE added in ccf4404, taken from there).
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v2.18.1-1)"
+        required: true
+      mundo_automatico:
+        description: "Back-port the auto-open world from 2.19.2 (Minecraft side only)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      SRC: 967b52fa9f51008681f4ab03c334feccf4deb054
+      LATER: ccf4404cd241c886bffbda199305774bc3075853
+      UP: https://github.com/JasonNinja15/Subnauticraft/releases/download/2.18.1
+      PLUGIN_SHA256: 99fdf938ad438445c634c5c6558122d7594c8066e334f045f542c5ddf6fcd861
+      UPJAR_SHA256: e36d436db8099d186dc300726944a5edd94f7a0158b984afe70f95815ead16b0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SRC }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Metadata (license fixed upstream later)
+        shell: pwsh
+        run: |
+          # 967b52f still says "All-Rights-Reserved" (a placeholder, per upstream MELTY_NOTES); upstream made it MIT in ccf4404
+          $f = 'minecraft/src/main/resources/fabric.mod.json'
+          $t = Get-Content $f -Raw
+          foreach ($pair in @(@('"All-Rights-Reserved"', '"MIT"'), @('"Jason"', '"JasonNinja15"'))) {
+            if (([regex]::Matches($t, [regex]::Escape($pair[0]))).Count -ne 1) { throw "expected $($pair[0]) once in $f" }
+            $t = $t.Replace($pair[0], $pair[1])
+          }
+          [IO.File]::WriteAllText((Resolve-Path $f), $t)
+          Invoke-WebRequest "https://raw.githubusercontent.com/${{ github.repository }}/$env:LATER/LICENSE" -OutFile LICENSE-upstream.txt
+          if (-not (Select-String -Path LICENSE-upstream.txt -Pattern 'MIT License' -Quiet)) { throw "LICENSE is not MIT" }
+
+      - name: Back-port auto world (optional)
+        if: ${{ inputs.mundo_automatico == 'true' }}
+        shell: pwsh
+        run: |
+          $base = "https://raw.githubusercontent.com/${{ github.repository }}/$env:LATER/minecraft/src/main/java/com/example/subnauticalink"
+          Invoke-WebRequest "$base/AutoWorld.java" -OutFile minecraft/src/main/java/com/example/subnauticalink/AutoWorld.java
+          Invoke-WebRequest "$base/mixin/LevelPropertiesMixin.java" -OutFile minecraft/src/main/java/com/example/subnauticalink/mixin/LevelPropertiesMixin.java
+          Invoke-WebRequest "$base/mixin/IntegratedServerLoaderMixin.java" -OutFile minecraft/src/main/java/com/example/subnauticalink/mixin/IntegratedServerLoaderMixin.java
+          function Patch([string]$file, [string]$old, [string]$new) {
+            $t = Get-Content $file -Raw
+            if (([regex]::Matches($t, [regex]::Escape($old))).Count -ne 1) { throw "expected the anchor once in $file" }
+            [IO.File]::WriteAllText((Resolve-Path $file), $t.Replace($old, $new))
+          }
+          Patch minecraft/src/main/java/com/example/subnauticalink/SubnauticaLinkClient.java "ClientDropsList.init();" "ClientDropsList.init();`n`n`t`t// Opening a world by itself (zJu4nn Hub back-port of upstream 2.19.2).`n`t`tAutoWorld.init();"
+          Patch minecraft/src/main/resources/subnautica_link.mixins.json '"GuardianInvoker",' "`"GuardianInvoker`",`n`t`t`"LevelPropertiesMixin`","
+          Patch minecraft/src/main/resources/subnautica_link.mixins.json '"InputUtilMixin",' "`"InputUtilMixin`",`n`t`t`"IntegratedServerLoaderMixin`","
+          Patch minecraft/gradle.properties "mod_version=2.18.1" "mod_version=2.18.1+hub.mundo"
+
+      - name: Fabric mod
+        shell: pwsh
+        run: |
+          $env:GRADLE_USER_HOME = Join-Path (Get-Location) '.tools\gradle-home'
+          .\minecraft\gradlew.bat -p .\minecraft --no-daemon --no-configuration-cache build -x test
+
+      - name: Upstream plugin (pinned)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory plugin -Force | Out-Null
+          Invoke-WebRequest "$env:UP/MinecraftLink.dll" -OutFile plugin/MinecraftLink.dll
+          $p = (Get-FileHash plugin/MinecraftLink.dll -Algorithm SHA256).Hash.ToLower()
+          if ($p -ne $env:PLUGIN_SHA256) { throw "plugin dll sha256 mismatch: $p" }
+          $iv = (Get-Item plugin/MinecraftLink.dll).VersionInfo.ProductVersion
+          "plugin version: $iv"
+          if ($iv -notlike "*$env:SRC*") { throw "plugin was not built from $env:SRC" }
+          Invoke-WebRequest "$env:UP/subnautica_link-2.18.1.jar" -OutFile plugin/upstream-mod.jar
+          $j = (Get-FileHash plugin/upstream-mod.jar -Algorithm SHA256).Hash.ToLower()
+          if ($j -ne $env:UPJAR_SHA256) { throw "upstream jar sha256 mismatch: $j" }
+
+      - name: Same classes as upstream
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $jar = Get-ChildItem minecraft/build/libs -Filter "*.jar" | Where-Object { $_.Name -notmatch 'sources' } | Select-Object -First 1
+          if (!$jar) { throw "mod jar not found" }
+          function Classes([string]$path) {
+            $z = [System.IO.Compression.ZipFile]::OpenRead($path)
+            try { $z.Entries | Where-Object { $_.FullName -like '*.class' } | ForEach-Object { $_.FullName } | Sort-Object } finally { $z.Dispose() }
+          }
+          $ours = @(Classes $jar.FullName)
+          $theirs = @(Classes (Resolve-Path plugin/upstream-mod.jar).Path)
+          $diff = Compare-Object $theirs $ours
+          "our jar: $($ours.Count) classes, $($jar.Length) bytes / upstream: $($theirs.Count) classes, $((Get-Item plugin/upstream-mod.jar).Length) bytes"
+          $diff | Format-Table -AutoSize | Out-String | Write-Host
+          # with the back-port, the only difference allowed is the three added classes
+          $extra = @('com/example/subnauticalink/AutoWorld.class', 'com/example/subnauticalink/mixin/LevelPropertiesMixin.class', 'com/example/subnauticalink/mixin/IntegratedServerLoaderMixin.class')
+          $bad = @($diff | Where-Object { -not ('${{ inputs.mundo_automatico }}' -eq 'true' -and $_.SideIndicator -eq '=>' -and $extra -contains $_.InputObject) })
+          if ($bad.Count) { throw "our jar's classes differ from upstream 2.18.1" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = '2.18.1'
+          $jar = Get-ChildItem minecraft/build/libs -Filter "*.jar" | Where-Object { $_.Name -notmatch 'sources' } | Select-Object -First 1
+          $p = 'pkg'
+          New-Item -ItemType Directory "$p/BepInEx/plugins/MinecraftLink","$p/mods" -Force | Out-Null
+          Copy-Item plugin/MinecraftLink.dll "$p/BepInEx/plugins/MinecraftLink/MinecraftLink.dll"
+          Copy-Item LICENSE-upstream.txt "$p/BepInEx/plugins/MinecraftLink/LICENSE.txt"
+          Copy-Item $jar.FullName "$p/mods/subnautica_link-$ver.jar"
+          Copy-Item LICENSE-upstream.txt "$p/LICENSE.txt"
+          @(
+            "Subnauticraft $ver (build do zJu4nn Hub)",
+            '',
+            'Jogue o Subnautica como o seu personagem do Minecraft. Original de JasonNinja15',
+            '(github.com/JasonNinja15/Subnauticraft), licenca MIT.',
+            'Projeto de fas, sem ligacao com Unknown Worlds, Mojang ou Microsoft.'
+          ) | Set-Content "$p/LEIA.txt" -Encoding utf8
+          $sums = Get-ChildItem $p -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring((Resolve-Path $p).Path.Length + 1).Replace('\','/')
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $rel"
+          }
+          $sums | Set-Content "$p/SHA256SUMS.txt" -Encoding ascii
+          $sums
+          $zip = "subnauticraft-hub-$ver.zip"
+          Compress-Archive -Path "$p/*" -DestinationPath $zip
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VER=$ver" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+          (Get-Item $zip).Length
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $extra = if ('${{ inputs.mundo_automatico }}' -eq 'true') { ' Minecraft side also carries the auto-open world back-ported from upstream 2.19.2 (ccf4404).' } else { '' }
+          gh release create "${{ inputs.tag }}" $env:ZIP --repo "${{ github.repository }}" --target main --title "Subnauticraft $env:VER (zJu4nn Hub)" --notes "Build of JasonNinja15/Subnauticraft $env:VER for the zJu4nn Hub Mashups tab. Minecraft mod compiled from this fork at $env:SRC; the Subnautica plugin is the upstream 2.18.1 MinecraftLink.dll (sha256 $env:PLUGIN_SHA256).$extra MIT."
